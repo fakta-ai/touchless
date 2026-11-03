@@ -1,0 +1,49 @@
+# A merge needs Codex's review of the pull request's latest commit. This sets the commit status `codex` on that
+# commit: pending until Codex's summary comment says it finished reviewing exactly that commit, then success. The
+# default branch's ruleset requires it beside resolved review threads.
+# Codex's summary carries its state as `<!-- codex-review-state:v1 {...} -->` (commit_sha, status), edited as it works.
+# Both triggers run the default branch's copy of this file and check out nothing, so a pull request can't change its
+# own gate.
+name: codex
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created, edited]
+permissions:
+  pull-requests: read
+  issues: read
+  statuses: write
+concurrency:
+  group: codex-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+jobs:
+  status:
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event.issue.pull_request && github.event.comment.user.login == 'chatgpt-codex-connector[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: status
+        id: status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          head=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          state=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]") | .body' \
+            | sed -n 's/.*codex-review-state:v1 \({.*}\) -->.*/\1/p' | tail -n 1)
+          reviewed=$(jq -r '.code_review.commit_sha // empty' <<< "${state:-{\}}")
+          done=$(jq -r '.code_review.status // empty' <<< "${state:-{\}}")
+          if [ "$reviewed" = "$head" ] && [ "$done" = completed ]; then
+            result=success description="Codex reviewed ${head:0:8}"
+          else
+            result=pending description="Waiting for Codex's review of ${head:0:8}"
+          fi
+          echo "$result: $description"
+          gh api -X POST "repos/$REPO/statuses/$head" -f state="$result" -f context=codex -f description="$description" \
+            --silent
